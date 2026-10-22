@@ -14,7 +14,7 @@ Hovering says the date or the place, and the values.
 
 ## Install
 
-You need telar with modules installed from a repository (its `main` after 0.2.0, or the next release),
+You need telar with modules installed from a repository (0.3 or later: `uv tool install 'telar[serve,bus]'`),
 Python 3.11+, and [uv](https://docs.astral.sh/uv/) for the map (it installs netCDF4 by itself).
 
 ```sh
