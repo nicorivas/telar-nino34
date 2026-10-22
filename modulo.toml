@@ -16,3 +16,6 @@ descripcion = "baja la serie diaria de Niño 3.4 (Climate Reanalyzer) y el mapa 
 
 [resultado]
 carpeta = "~/.local/state/nino34"
+
+[requiere]
+programas = ["uv"]   # el mapa: bin/pacifico-sst corre con uv, que instala netCDF4 solo
