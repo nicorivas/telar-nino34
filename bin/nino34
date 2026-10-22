@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""nino34 — la temperatura del mar en la región Niño 3.4, día a día, como en Climate Reanalyzer
+(https://www.climatereanalyzer.org/clim/sst_daily/?dm_id=nino3.4), dibujada en braille.
+
+  nino34 bajar [--carpeta DIR]   baja el JSON de Climate Reanalyzer (NOAA OISST v2.1) y deja
+                                 DIR/AAAA-MM-DD.json, compacto (lo corre el periódico `nino34-bajar`
+                                 del servidor; DIR por omisión ~/.local/state/nino34)
+  nino34 pagina                  la página del bloque `nino34` del dashboard: lee el último
+                                 resultado (`telar resultado nino34`, vive en el servidor), arma
+                                 ~/.local/state/nino34/nino34.html y escribe el JSON de la página
+
+El dibujo lo hace el HTML en el panel, al ancho que tenga: cada carácter braille son 2×4 puntos.
+Los años desde 1982 van tenues, la media 1991–2020 punteada con su banda de ±2σ de fondo, el año
+pasado en azul, este en durazno y lo preliminar (los últimos días, sin control de calidad) en
+amarillo. Debajo, del mismo ancho, el mapa del Pacífico del último día (`pacifico-sst`): la
+temperatura o su anomalía en color, con medio bloque por píxel (▀: arriba el color de la letra,
+abajo el del fondo) y la caja de Niño 3.4 marcada. Pasar el mouse dice la fecha o el lugar, y
+los valores.
+"""
+import datetime as dt
+import json
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+URL = "https://climatereanalyzer.org/clim/sst_daily/json_2clim/oisst2.1_nino3.4_sst_day.json"
+PAGINA = "https://www.climatereanalyzer.org/clim/sst_daily/?dm_id=nino3.4"
+ESTADO = Path.home() / ".local/state/nino34"
+GUARDAR_DIAS = 30
+
+
+def _r(v):
+    return None if v is None else round(v, 2)
+
+
+def bajar(carpeta: Path) -> int:
+    pedido = urllib.request.Request(URL, headers={"User-Agent": "Mozilla/5.0 (nino34)"})
+    with urllib.request.urlopen(pedido, timeout=60) as r:
+        series = {s["name"]: s["data"] for s in json.load(r)}
+    anios = {k: [_r(v) for v in d] for k, d in series.items() if k.isdigit() and any(v is not None for v in d)}
+    # la desviación de cada día en 1991–2020, para la banda de ±2σ (como la sombra de Climate Reanalyzer)
+    base = [anios[str(a)] for a in range(1991, 2021) if str(a) in anios]
+    sigma = []
+    for i in range(366):
+        xs = [s[i] for s in base if i < len(s) and s[i] is not None]
+        m = sum(xs) / len(xs) if xs else 0
+        sigma.append(round((sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5, 3) if len(xs) > 1 else None)
+    datos = {
+        "fuente": "NOAA OISST v2.1 vía Climate Reanalyzer (Univ. de Maine)", "url": PAGINA,
+        "bajado": dt.datetime.now().isoformat(timespec="minutes"),
+        "anios": anios,
+        "preliminar": [_r(v) for v in series.get("Preliminary", [])],
+        "clima": [_r(v) for v in series.get("1991-2020", [])],
+        "sigma": sigma,
+        "mapa": mapa(),
+    }
+    carpeta.mkdir(parents=True, exist_ok=True)
+    destino = carpeta / f"{dt.date.today().isoformat()}.json"
+    tmp = destino.with_suffix(".tmp")
+    tmp.write_text(json.dumps(datos, separators=(",", ":")))
+    tmp.replace(destino)
+    for viejo in sorted(carpeta.glob("????-??-??.json"))[:-GUARDAR_DIAS]:
+        viejo.unlink()
+    print(f"nino34: {destino} ({len(anios)} años{', mapa del ' + datos['mapa']['fecha'] if datos['mapa'] else ', sin mapa'})")
+    return 0
+
+
+def mapa() -> dict | None:
+    """La grilla del Pacífico del último día (`pacifico-sst`, que necesita uv). Si falla, el
+    gráfico sigue sin mapa: el error va al log del periódico."""
+    uv = shutil.which("uv") or str(Path.home() / ".local/bin/uv")
+    try:
+        r = subprocess.run([uv, "run", "--quiet", "--script", str(Path(__file__).resolve().parent / "pacifico-sst")],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        print(f"nino34: sin mapa: {r.stderr.strip()[-300:]}", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        print(f"nino34: sin mapa: {e}", file=sys.stderr)
+    return None
+
+
+def _ultimo(datos: dict) -> tuple[str, int, float, str]:
+    """El último dato: (serie, día del año desde 0, valor, fecha legible)."""
+    anio = max(datos["anios"])
+    for serie, valores in (("preliminar", datos["preliminar"]), (anio, datos["anios"][anio])):
+        for i in range(len(valores) - 1, -1, -1):
+            if valores[i] is not None:
+                fecha = dt.date(int(anio), 1, 1) + dt.timedelta(days=i)
+                return serie, i, valores[i], f"{fecha.day}-{('ene feb mar abr may jun jul ago sep oct nov dic').split()[fecha.month - 1]}"
+    return anio, 0, 0.0, ""
+
+
+def _num(x: float, signo=False) -> str:
+    return (f"{x:+.2f}" if signo else f"{x:.2f}").replace(".", ",")
+
+
+def pagina() -> int:
+    try:
+        r = subprocess.run(["telar", "resultado", "nino34", "--json"], capture_output=True, text=True, timeout=60)
+        res = json.loads(r.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        res = {"ok": False, "error": str(e)}
+    datos = res.get("contenido") if res.get("ok") else None
+    if not datos:
+        motivo = res.get("error") or res.get("aviso") or "todavía no hay datos: el periódico `nino34-bajar` los baja dos veces al día"
+        print(json.dumps({"titulo": "Niño 3.4", "bloques": [{"texto": f"Sin gráfico: {motivo}."}]}, ensure_ascii=False))
+        return 0
+    serie, i, valor, fecha = _ultimo(datos)
+    clima = datos["clima"][i] if i < len(datos["clima"]) else None
+    anom = valor - clima if clima is not None else 0.0
+    fase = ("El Niño fuerte" if anom >= 1.5 else "El Niño" if anom >= 0.5 else
+            "La Niña fuerte" if anom <= -1.5 else "La Niña" if anom <= -0.5 else "neutro")
+    sub = (f"{_num(valor)} °C el {fecha}{' (preliminar)' if serie == 'preliminar' else ''} · "
+           f"{_num(anom, True)} °C sobre 1991–2020 · {fase}")
+    ESTADO.mkdir(parents=True, exist_ok=True)
+    html = ESTADO / "nino34.html"
+    html.write_text(HTML.replace("/*DATOS*/null", json.dumps(datos, separators=(",", ":")).replace("<", "\\u003c")))
+    texto = (f"Temperatura diaria de la superficie del mar en la región Niño 3.4 (5°N–5°S, 170°W–120°W). "
+             f"Una anomalía sostenida sobre +0,5 °C es condición de El Niño. Fuente: {datos['fuente']}, "
+             f"bajado {datos['bajado'].replace('T', ' ')}{' · ' + res['aviso'] if res.get('aviso') else ''}."
+             + (f" El mapa es el archivo diario de NCEI del {datos['mapa']['fecha']}, promediado a 1°; "
+                "la caja blanca es la región Niño 3.4." if datos.get("mapa") else ""))
+    print(json.dumps({"titulo": "Niño 3.4", "subtitulo": sub,
+                      "bloques": [{"lienzo": {"archivo": str(html), "alto": 1060 if datos.get("mapa") else 470}}, {"texto": texto}]},
+                     ensure_ascii=False))
+    return 0
+
+
+HTML = r"""<!doctype html><html><head><meta charset="utf-8"><style>
+  :root { --base:#1e1e2e; --texto:#cdd6f4; --tenue:#6c7086; --gris:#45475a; --banda:rgba(137,180,250,.10);
+          --clima:#a6adc8; --azul:#89b4fa; --durazno:#fab387; --amarillo:#f9e2af; --rojo:#f38ba8; }
+  html, body { margin:0; background:transparent; color:var(--texto); }
+  body { font: 12px/1 "SF Mono", Menlo, "JetBrains Mono", monospace; }
+  pre { margin:0; font: inherit; line-height: 1; white-space: pre; cursor: crosshair; }
+  /* cada carácter en una celda del mismo ancho: el braille cae en otra fuente, y sin esto el eje no calza */
+  pre i { font-style: normal; display: inline-block; width: var(--cw, 7.2px); text-align: center; }
+  .g { color:var(--gris) } .c { color:var(--clima) } .a { color:var(--azul) } .d { color:var(--durazno) }
+  .p { color:var(--amarillo) } .t { color:var(--tenue) } .b { background:var(--banda) } .r { color:var(--rojo) }
+  #ley, #mira, #mley, #mmira { margin: 0 0 8px; line-height: 1.4; white-space: pre; } #mira, #mmira { margin: 8px 0 0; color: var(--tenue); }
+  #mapa { margin-top: 26px; } #mtit { margin: 0 0 8px; line-height: 1.4; } #mtit b { font-weight: normal; color: var(--texto); }
+  .boton { cursor: pointer; color: var(--tenue); padding: 0 1ch; } .boton.si { color: var(--base); background: var(--durazno); }
+</style></head><body><div id="ley"></div><pre id="g"></pre><div id="mira"> </div>
+<div id="mapa" hidden><div id="mtit"></div><pre id="m"></pre><div id="mley"></div><div id="mmira"> </div></div><script>
+(function () {
+  var D = /*DATOS*/null;
+  var MESES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+  var INICIO = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];   // día del año (bisiesto) de cada mes
+  var anios = Object.keys(D.anios).sort(), este = anios[anios.length - 1], pasado = anios[anios.length - 2];
+  // las capas, de abajo hacia arriba: en una celda manda la de más arriba que tenga puntos ahí
+  var capas = [];
+  anios.forEach(function (a) { if (a !== este && a !== pasado) capas.push({ v: D.anios[a], k: 'g', n: 1 }); });
+  capas.push({ v: D.clima, k: 'c', n: 2, punteada: true });
+  capas.push({ v: D.anios[pasado], k: 'a', n: 3 });
+  capas.push({ v: D.preliminar, k: 'p', n: 4, unir: D.anios[este] });
+  capas.push({ v: D.anios[este], k: 'd', n: 5 });
+  var lo = Infinity, hi = -Infinity;
+  anios.forEach(function (a) { D.anios[a].forEach(function (x) { if (x !== null) { lo = Math.min(lo, x); hi = Math.max(hi, x); } }); });
+  D.preliminar.forEach(function (x) { if (x !== null) hi = Math.max(hi, x); });
+  lo = Math.floor(lo * 2) / 2 - 0.25; hi = Math.ceil(hi * 2) / 2 + 0.25;
+  var BITS = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];   // braille: fila, columna → bit
+  var IZQ = 6, FILAS = 26, cols, px, py;
+
+  function dibujar() {
+    var ancho = document.body.clientWidth || 800;
+    var cw = medir();
+    document.getElementById('g').style.setProperty('--cw', cw + 'px');
+    cols = Math.max(40, Math.floor(ancho / cw) - IZQ - 1);
+    px = cols * 2; py = FILAS * 4;
+    var celdas = [];
+    for (var f = 0; f < FILAS; f++) { celdas.push([]); for (var c = 0; c < cols; c++) celdas[f].push({ n: 0, k: '', bits: 0, b: false }); }
+    var X = function (i) { return Math.round(i / 365 * (px - 1)); };
+    var Y = function (v) { return Math.round((hi - v) / (hi - lo) * (py - 1)); };
+    // la banda de ±2σ alrededor de la media, de fondo
+    D.clima.forEach(function (m, i) {
+      var s = D.sigma[i]; if (m === null || s === null) return;
+      var c = Math.floor(X(i) / 2), f0 = Math.floor(Y(m + 2 * s) / 4), f1 = Math.floor(Y(m - 2 * s) / 4);
+      for (var f = Math.max(0, f0); f <= Math.min(FILAS - 1, f1); f++) if (celdas[f][c]) celdas[f][c].b = true;
+    });
+    capas.forEach(function (capa) {
+      var pts = [];
+      capa.v.forEach(function (v, i) { if (v !== null) pts.push([X(i), Y(v)]); });
+      if (capa.unir && pts.length) {   // lo preliminar arranca donde termina el año
+        for (var j = capa.unir.length - 1; j >= 0; j--) if (capa.unir[j] !== null) { pts.unshift([X(j), Y(capa.unir[j])]); break; }
+      }
+      var marcas = {};   // por celda, los puntos de esta capa
+      // cada tramo entre dos días seguidos se rellena columna por columna, sin huecos verticales
+      var tramo = function (x, ya, yb) {
+        if (capa.punteada && (x % 4) > 1) return;
+        for (var y = Math.min(ya, yb); y <= Math.max(ya, yb); y++) poner(marcas, x, y);
+      };
+      for (var p = 0; p < pts.length; p++) {
+        var a = pts[p - 1], b = pts[p];
+        if (!a) { tramo(b[0], b[1], b[1]); continue; }
+        var dx = b[0] - a[0];
+        if (dx <= 0) { tramo(b[0], a[1], b[1]); continue; }
+        for (var x = a[0] + 1; x <= b[0]; x++) {
+          var y0 = Math.round(a[1] + (b[1] - a[1]) * (x - 1 - a[0]) / dx), y1 = Math.round(a[1] + (b[1] - a[1]) * (x - a[0]) / dx);
+          tramo(x, x - 1 === a[0] ? a[1] : y0, y1);
+        }
+      }
+      Object.keys(marcas).forEach(function (llave) {
+        var m = marcas[llave], cel = celdas[m.f][m.c];
+        if (capa.n >= cel.n) { cel.n = capa.n; cel.k = capa.k; cel.bits = m.bits; }
+      });
+    });
+    var filas = [];
+    for (var f = 0; f < FILAS; f++) {
+      var etiqueta = '';
+      for (var t = Math.ceil(lo); t <= hi; t++) if (Math.floor(Y(t) / 4) === f) etiqueta = t + '°';
+      var linea = celdasDe(pad(etiqueta, IZQ - 2) + (etiqueta ? ' ┤' : ' │'), 't');
+      for (var c = 0; c < cols; c++) {
+        var cel = celdas[f][c], ch = cel.bits ? String.fromCharCode(0x2800 + cel.bits) : ' ';
+        linea += celda(ch, ((cel.bits ? cel.k : '') + (cel.b ? ' b' : '')).trim());
+      }
+      filas.push(linea);
+    }
+    // el eje del tiempo: un ┬ al comienzo de cada mes y su nombre debajo
+    var eje = new Array(cols).fill('─'), nombres = new Array(cols + 4).fill(' ');
+    INICIO.forEach(function (d, m) {
+      var c = Math.floor(X(d) / 2); eje[c] = '┬';
+      for (var k = 0; k < 3; k++) nombres[c + k] = MESES[m][k];
+    });
+    filas.push(celdasDe(pad('', IZQ - 2) + ' └' + eje.join(''), 't'));
+    filas.push(celdasDe(pad('', IZQ) + nombres.join(''), 't'));
+    document.getElementById('g').innerHTML = filas.join('\n');
+    document.getElementById('ley').innerHTML =
+      '<span class="d">⣿⣿ ' + este + '</span>   <span class="p">⣿⣿ preliminar</span>   <span class="a">⣿⣿ ' + pasado + '</span>   '
+      + '<span class="c">⠉⠀⠉ media 1991–2020</span>   <span class="b"> ±2σ </span>   <span class="g">⣿⣿ ' + anios[0] + '–' + anios[anios.length - 3] + '</span>';
+  }
+
+  function poner(marcas, x, y) {
+    if (x < 0 || y < 0 || x >= px || y >= py) return;
+    var c = x >> 1, f = y >> 2, llave = f * 10000 + c;
+    var m = marcas[llave] || (marcas[llave] = { f: f, c: c, bits: 0 });
+    m.bits |= BITS[y & 3][x & 1];
+  }
+  function celda(ch, cls) { return '<i' + (cls ? ' class="' + cls + '"' : '') + '>' + (ch === ' ' ? '&nbsp;' : ch) + '</i>'; }
+  function celdasDe(texto, cls) { return Array.from(texto).map(function (ch) { return celda(ch, cls); }).join(''); }
+  function pad(s, n) { s = String(s); while (s.length < n) s = ' ' + s; return s; }
+  function medir() {
+    var s = document.createElement('span'); s.style.font = 'inherit'; s.style.visibility = 'hidden';
+    s.textContent = 'MMMMMMMMMM'; document.body.appendChild(s);
+    var w = s.getBoundingClientRect().width / 10; s.remove(); return w || 7.2;
+  }
+  function num(x, signo) { return x === null || x === undefined ? '—' : (signo && x >= 0 ? '+' : '') + x.toFixed(2).replace('.', ','); }
+
+  // el mouse: la fecha bajo el cursor y lo que valía cada serie ese día
+  document.getElementById('g').addEventListener('mousemove', function (e) {
+    var r = e.currentTarget.getBoundingClientRect(), cw = r.width / (cols + IZQ);
+    var c = Math.floor((e.clientX - r.left) / cw) - IZQ; if (c < 0 || c >= cols) return;
+    var i = Math.max(0, Math.min(365, Math.round((c * 2 + 0.5) / (px - 1) * 365)));
+    var fecha = new Date(Date.UTC(2024, 0, 1 + i)), m = D.clima[i];
+    var hoy = D.anios[este][i] !== null && D.anios[este][i] !== undefined ? D.anios[este][i] : D.preliminar[i];
+    document.getElementById('mira').innerHTML = fecha.getUTCDate() + '-' + MESES[fecha.getUTCMonth()] + ' · '
+      + '<span class="d">' + este + ' ' + num(hoy) + '°</span>'
+      + (hoy !== null && hoy !== undefined && m !== null ? ' (<span class="' + (hoy - m >= 0 ? 'r' : 'a') + '">' + num(hoy - m, true) + '</span>)' : '')
+      + ' · <span class="a">' + pasado + ' ' + num(D.anios[pasado][i]) + '°</span> · <span class="c">media ' + num(m) + '°</span>'
+      + ' · ±2σ ' + num(D.sigma[i] === null ? null : 2 * D.sigma[i]) + '°';
+  });
+  // ── el mapa del Pacífico: un píxel por media celda (▀ con color de letra arriba y de fondo abajo)
+  var M = D.mapa, capa = 'sst', mfil = 0, mcol = 0;
+  var PALETAS = {
+    sst: [[-2, '#24326e'], [6, '#3b6fd8'], [13, '#2fb8d8'], [19, '#3fc98a'], [24, '#e8d04a'], [27, '#f59a3c'], [29, '#e8453c'], [31, '#9c1d4a']],
+    anom: [[-4, '#2b3a9a'], [-2, '#5b86e8'], [-0.8, '#9cc0f5'], [0, '#45475a'], [0.8, '#f5b49a'], [2, '#e8704f'], [4, '#b0132e']]
+  };
+  var TIERRA = '#181825', CAJA = '#cdd6f4';
+  function color(v, paleta) {
+    var p = PALETAS[paleta];
+    if (v <= p[0][0]) return p[0][1];
+    for (var k = 1; k < p.length; k++) if (v <= p[k][0]) {
+      var t = (v - p[k - 1][0]) / (p[k][0] - p[k - 1][0]);
+      return mezclar(p[k - 1][1], p[k][1], t);
+    }
+    return p[p.length - 1][1];
+  }
+  function mezclar(a, b, t) {
+    var x = parseInt(a.slice(1), 16), y = parseInt(b.slice(1), 16), r = 0;
+    for (var s = 16; s >= 0; s -= 8) r = r * 256 + Math.round(((x >> s) & 255) * (1 - t) + ((y >> s) & 255) * t);
+    return '#' + ('000000' + r.toString(16)).slice(-6);
+  }
+  function lugar(px, py, mpx, mpy) {   // el píxel → (lat, lon) de su centro
+    return [M.norte - (py + 0.5) / mpy * (M.norte - M.sur), M.oeste + (px + 0.5) / mpx * (M.este - M.oeste)];
+  }
+  function valor(lat, lon, cual) {
+    var i = Math.floor((M.norte - lat) / M.paso), j = Math.floor((lon - M.oeste) / M.paso);
+    var fila = M[cual][i]; return fila && fila[j] !== null && fila[j] !== undefined ? fila[j] / 10 : null;
+  }
+  // el borde de Niño 3.4 (5°N–5°S, 170°W–120°W), en píxeles: un píxel de grosor, los cuatro lados
+  function enCaja(px, py, mpx, mpy) {
+    var X = function (lon) { return Math.floor((lon - M.oeste) / (M.este - M.oeste) * mpx); };
+    var Y = function (lat) { return Math.floor((M.norte - lat) / (M.norte - M.sur) * mpy); };
+    var x0 = X(190), x1 = X(240), y0 = Y(5), y1 = Y(-5);
+    return (px >= x0 && px <= x1 && (py === y0 || py === y1)) || (py >= y0 && py <= y1 && (px === x0 || px === x1));
+  }
+  function lonTexto(l) { l = ((l + 180) % 360) - 180; return l === 0 ? '0°' : l === -180 || l === 180 ? '180°' : Math.abs(l) + (l > 0 ? '°E' : '°W'); }
+  function dibujarMapa() {
+    if (!M) return;
+    document.getElementById('mapa').hidden = false;
+    var cw = medir(), alto = 12;   // la celda: el ancho de la letra y una línea de 12 px
+    mcol = cols;
+    var dlon = (M.este - M.oeste) / mcol, dlat = dlon * (alto / 2) / cw;   // píxeles cuadrados en el mapa
+    var mpy = Math.round((M.norte - M.sur) / dlat); if (mpy % 2) mpy++;
+    mfil = mpy / 2;
+    var filas = [];
+    var etiquetas = {};
+    [40, 20, 0, -20, -40].forEach(function (l) { etiquetas[Math.floor((M.norte - l) / (M.norte - M.sur) * mpy / 2)] = l === 0 ? '0°' : Math.abs(l) + (l > 0 ? '°N' : '°S'); });
+    for (var f = 0; f < mfil; f++) {
+      var e = etiquetas[f] || '';
+      var linea = celdasDe(pad(e, IZQ - 2) + (e ? ' ┤' : ' │'), 't');
+      for (var c = 0; c < mcol; c++) {
+        var cs = [0, 1].map(function (k) {
+          var ll = lugar(c, f * 2 + k, mcol, mpy), v = valor(ll[0], ll[1], capa);
+          if (enCaja(c, f * 2 + k, mcol, mpy)) return CAJA;
+          return v === null ? TIERRA : color(v, capa);
+        });
+        linea += '<i style="color:' + cs[0] + ';background:' + cs[1] + '">▀</i>';
+      }
+      filas.push(linea);
+    }
+    var eje = new Array(mcol).fill('─'), nombres = new Array(mcol + 8).fill(' ');
+    [120, 150, 180, 210, 240, 270].forEach(function (l) {
+      var c = Math.round((l - M.oeste) / dlon); if (c < 0 || c >= mcol) return;
+      eje[c] = '┬'; var t = lonTexto(l), k0 = Math.max(0, c - Math.floor(t.length / 2));
+      for (var k = 0; k < t.length; k++) nombres[k0 + k] = t[k];
+    });
+    filas.push(celdasDe(pad('', IZQ - 2) + ' └' + eje.join(''), 't'));
+    filas.push(celdasDe(pad('', IZQ) + nombres.join(''), 't'));
+    var m = document.getElementById('m'); m.style.setProperty('--cw', cw + 'px'); m.innerHTML = filas.join('\n');
+    document.getElementById('mtit').innerHTML = '<b>El Pacífico, ' + M.fecha + '</b>   '
+      + '<span class="boton' + (capa === 'sst' ? ' si' : '') + '" data-capa="sst">temperatura</span>'
+      + '<span class="boton' + (capa === 'anom' ? ' si' : '') + '" data-capa="anom">anomalía</span>'
+      + '   <span class="t">▢ Niño 3.4</span>';
+    // la escala: una barra de colores con sus extremos y el medio
+    var p = PALETAS[capa], lo2 = p[0][0], hi2 = p[p.length - 1][0], n = 40, barra = '';
+    for (var k = 0; k < n; k++) barra += '<span style="color:' + color(lo2 + (hi2 - lo2) * (k + 0.5) / n, capa) + '">█</span>';
+    var u = capa === 'sst' ? '°C' : '°C sobre 1991–2020';
+    document.getElementById('mley').innerHTML = pad('', IZQ) + '<span class="t">' + lo2 + '</span> ' + barra + ' <span class="t">' + (capa === 'anom' ? '+' : '') + hi2 + ' ' + u + '</span>';
+  }
+  document.getElementById('mapa').addEventListener('click', function (e) {
+    var c = e.target.getAttribute && e.target.getAttribute('data-capa');
+    if (c && c !== capa) { capa = c; dibujarMapa(); }
+  });
+  document.getElementById('m').addEventListener('mousemove', function (e) {
+    var r = e.currentTarget.getBoundingClientRect(), cw = r.width / (mcol + IZQ);
+    var c = Math.floor((e.clientX - r.left) / cw) - IZQ, py = Math.floor((e.clientY - r.top) / (r.height / (mfil + 2)) * 2);
+    if (c < 0 || c >= mcol || py >= mfil * 2) return;
+    var ll = lugar(c, py, mcol, mfil * 2), s = valor(ll[0], ll[1], 'sst'), a = valor(ll[0], ll[1], 'anom');
+    var lat = Math.round(ll[0]), lon = Math.round(ll[1]);
+    document.getElementById('mmira').innerHTML = (lat === 0 ? '0°' : Math.abs(lat) + (lat > 0 ? '°N' : '°S')) + ' ' + lonTexto(lon) + ' · '
+      + (s === null ? 'tierra' : '<span class="d">' + num(s) + '°</span> (<span class="' + (a >= 0 ? 'r' : 'a') + '">' + num(a, true) + '</span>)');
+  });
+
+  dibujar(); dibujarMapa();
+  var espera; window.addEventListener('resize', function () { clearTimeout(espera); espera = setTimeout(function () { dibujar(); dibujarMapa(); }, 120); });
+})();
+</script></body></html>
+"""
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["bajar"]:
+        carpeta = Path(argv[argv.index("--carpeta") + 1]).expanduser() if "--carpeta" in argv else ESTADO
+        return bajar(carpeta)
+    if argv[:1] == ["pagina"]:
+        return pagina()
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

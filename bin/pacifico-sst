@@ -1,0 +1,79 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["netCDF4", "numpy"]
+# ///
+"""pacifico-sst — la temperatura del mar del Pacífico del último día publicado, en una grilla de 1°.
+
+  pacifico-sst            imprime el JSON de la grilla (lo usa `nino34 bajar`)
+  pacifico-sst AAAA-MM-DD ese día
+
+Lee el archivo diario de NOAA OISST v2.1 (NCEI, 0,25°, con su anomalía sobre 1991–2020), la misma
+serie del gráfico de Niño 3.4, y promedia cada 4×4 celdas: de 45°S a 45°N y de 100°E a 70°W.
+Valores en décimas de grado (enteros) y `null` en tierra o hielo, para que el JSON pese poco.
+"""
+import datetime as dt
+import json
+import re
+import sys
+import tempfile
+import urllib.request
+
+import netCDF4
+import numpy as np
+
+BASE = "https://www.ncei.noaa.gov/data/sea-surface-temperature-optimum-interpolation/v2.1/access/avhrr"
+LAT = (-45, 45)     # sur, norte
+LON = (100, 290)    # este de Greenwich, 0–360 (290 = 70°W, la costa de Chile)
+
+
+def _abrir(url: str) -> bytes:
+    pedido = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (pacifico-sst)"})
+    with urllib.request.urlopen(pedido, timeout=120) as r:
+        return r.read()
+
+
+def ultimo(dia: str = "") -> tuple[str, str]:
+    """(url, fecha) del archivo de ese día, o del más nuevo de este mes o el anterior."""
+    hoy = dt.date.fromisoformat(dia) if dia else dt.date.today()
+    for mes in (hoy, hoy.replace(day=1) - dt.timedelta(days=1)):
+        carpeta = f"{BASE}/{mes:%Y%m}/"
+        nombres = sorted(set(re.findall(r"oisst-avhrr-v02r01\.(\d{8})(_preliminary)?\.nc", _abrir(carpeta).decode())))
+        if dia:
+            nombres = [n for n in nombres if n[0] == hoy.strftime("%Y%m%d")]
+        if nombres:
+            # del mismo día, el final antes que el preliminar
+            fecha = max(n[0] for n in nombres)
+            sufijo = "" if (fecha, "") in nombres else "_preliminary"
+            return f"{carpeta}oisst-avhrr-v02r01.{fecha}{sufijo}.nc", f"{fecha[:4]}-{fecha[4:6]}-{fecha[6:]}" + (" (preliminar)" if sufijo else "")
+    raise SystemExit(f"pacifico-sst: no encuentro el archivo de {hoy}")
+
+
+def grilla(var) -> list:
+    """La variable en la caja, promediada de a 4×4 (1°), en décimas de grado; None donde no hay mar."""
+    datos = np.ma.filled(var[0, 0, :, :].astype("f8"), np.nan)     # [lat 720][lon 1440], de 89,875°S hacia el norte
+    i0, i1 = (LAT[0] + 90) * 4, (LAT[1] + 90) * 4
+    j0, j1 = LON[0] * 4, LON[1] * 4
+    caja = datos[i0:i1, j0:j1]
+    bloques = caja.reshape((i1 - i0) // 4, 4, (j1 - j0) // 4, 4)
+    with np.errstate(invalid="ignore"), __import__("warnings").catch_warnings():
+        __import__("warnings").simplefilter("ignore", category=RuntimeWarning)
+        media = np.nanmean(bloques, axis=(1, 3))
+    return [[None if np.isnan(v) else int(round(v * 10)) for v in fila] for fila in media[::-1]]   # de norte a sur
+
+
+def main(argv: list[str]) -> int:
+    url, fecha = ultimo(argv[0] if argv else "")
+    with tempfile.NamedTemporaryFile(suffix=".nc") as f:
+        f.write(_abrir(url))
+        f.flush()
+        with netCDF4.Dataset(f.name) as nc:
+            nc.set_auto_mask(True)
+            salida = {"fecha": fecha, "url": url, "paso": 1, "norte": LAT[1], "sur": LAT[0],
+                      "oeste": LON[0], "este": LON[1], "sst": grilla(nc["sst"]), "anom": grilla(nc["anom"])}
+    json.dump(salida, sys.stdout, separators=(",", ":"))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
