@@ -5,7 +5,7 @@
   nino34 bajar [--carpeta DIR]   baja el JSON de Climate Reanalyzer (NOAA OISST v2.1) y deja
                                  DIR/AAAA-MM-DD.json, compacto (lo corre el periódico `nino34-bajar`
                                  del servidor; DIR por omisión ~/.local/state/nino34)
-  nino34 pagina                  la página del bloque `nino34` del dashboard: lee el último
+  nino34 pagina                  la página de la app `nino34`: lee el último
                                  resultado (`telar resultado nino34`, vive en el servidor), arma
                                  ~/.local/state/nino34/nino34.html y escribe el JSON de la página
 

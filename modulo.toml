@@ -1,13 +1,12 @@
-# Módulo de telar: lo que este repositorio aporta al dashboard (ver docs/configuracion.md de telar, [modulos]).
+# Módulo de telar: lo que este repositorio aporta a telar (ver docs/configuracion.md de telar, [modulos]).
 # Se instala con `telar modulos instalar https://github.com/nicorivas/telar-nino34` en cada máquina: la que
-# muestra la pestaña y la que corre los periódicos (en esa, después, `telar periodicos aplicar`).
+# muestra la app y la que corre los periódicos (en esa, después, `telar periodicos aplicar`).
 nombre = "nino34"
 descripcion = "la temperatura del mar en Niño 3.4 y el mapa del Pacífico"
 
-[pestana]
+[app]
 nombre = "niño 3.4"
-comando = ["bin/nino34", "pagina"]
-color = "amarillo"
+pagina = ["bin/nino34", "pagina"]
 
 [periodicos.bajar]
 cuando = "30 7,15 * * *"
